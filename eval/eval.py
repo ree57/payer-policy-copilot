@@ -74,31 +74,31 @@ def evidence_ranks(results, evidence):
             for e in evidence]
 
 
-def retrieval_metrics(ranks):
-    """hit@k, recall@k for each k in KS, and reciprocal rank of the first evidence hit."""
-    found = [r for r in ranks if r is not None]
-    metrics = {}
-    for k in KS:
-        metrics[f"hit@{k}"] = float(any(r <= k for r in found))
-        metrics[f"recall@{k}"] = sum(r <= k for r in found) / len(ranks)
-    metrics["rr"] = 1 / min(found) if found else 0.0
-    return metrics
-
-
 def score_retrieval(questions):
-    """Every answerable question x collection x filter on/off -> one row of ranks and metrics."""
+    """Every answerable question x collection x filter on/off -> one row of ranks and metrics.
+
+    Each k gets its own retrieval rather than the first k of a k=8 list: per-insurer
+    retrieval splits k between insurers, so the top 3 of a k=8 list is not what k=3 returns.
+    MRR and the stored ranks come from the k=8 run.
+    """
     rows = []
     for q in (q for q in questions if q["answerable"]):
         for collection in COLLECTIONS:
             for use_filter in (True, False):
-                if use_filter:
-                    results, where, fell_back = rag.retrieve(q["question"], collection, max(KS))
-                else:
-                    results, where, fell_back = search(q["question"], collection, k=max(KS)), {}, False
-                ranks = evidence_ranks(results, q["evidence"])
+                metrics = {}
+                for k in KS:
+                    if use_filter:
+                        results, where, fell_back = rag.retrieve(q["question"], collection, k)
+                    else:
+                        results, where, fell_back = search(q["question"], collection, k=k), {}, False
+                    ranks = evidence_ranks(results, q["evidence"])
+                    found = [r for r in ranks if r is not None]
+                    metrics[f"hit@{k}"] = float(bool(found))
+                    metrics[f"recall@{k}"] = len(found) / len(ranks)
+                metrics["rr"] = 1 / min(found) if found else 0.0   # k = max(KS), the last run
                 rows.append({"id": q["id"], "category": q["category"], "collection": collection,
                              "filter": use_filter, "where": where, "fell_back": fell_back,
-                             "ranks": ranks, **retrieval_metrics(ranks)})
+                             "ranks": ranks, **metrics})
     return rows
 
 

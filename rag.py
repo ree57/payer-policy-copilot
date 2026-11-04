@@ -52,7 +52,9 @@ Rules:
 4. If the question asks about an insurer, plan or drug that does not appear in any source header, \
 say explicitly that you don't have that insurer's or drug's policy, and list which insurers you do \
 have for that drug, using the document list below. Do not answer from other insurers' policies as \
-a substitute.
+a substitute. Base every "I don't have X" statement on the document list, not on which sources \
+were retrieved: if the list has a document that is not among the sources, say the provided \
+sources don't cover it, not that it doesn't exist.
 5. For coverage questions, prefer policy and formulary sources over FDA labels, and say which \
 insurer and policy date the answer comes from.
 6. If sources disagree (different insurers or dates), say so rather than merging them.
@@ -97,8 +99,43 @@ def question_filter(question):
     return {field: values.pop() for field, values in matches.items() if len(values) == 1}
 
 
+def insurers_named(question):
+    """Insurer source values named in the question, in FILTER_RULES order."""
+    return [value for field, value, pattern in FILTER_RULES
+            if field == "source" and re.search(pattern, question, re.I)]
+
+
+def retrieve_per_insurer(question, collection, k, insurers):
+    """Comparison questions: one filtered search per insurer with k split evenly, then merged.
+
+    Each insurer gets k // n slots (the first k % n insurers one extra) and keeps any
+    drug filter; results stay grouped by insurer and are renumbered 1..k for the prompt.
+    """
+    base = question_filter(question)                 # drops "source" when 2+ insurers match
+    merged, seen = [], set()
+    for i, insurer in enumerate(insurers):
+        share = k // len(insurers) + (i < k % len(insurers))
+        for r in search(question, collection, k=share, where={**base, "source": insurer}):
+            if r["chunk_id"] not in seen:
+                seen.add(r["chunk_id"])
+                merged.append(r)
+    for rank, r in enumerate(merged, start=1):
+        r["rank"] = rank
+    return merged, {**base, "source": insurers}
+
+
 def retrieve(question, collection, k, use_filter=True):
-    """Top-k chunks -> (results, filter used, fell back?). Unfiltered if the filter finds < 3."""
+    """Top-k chunks -> (results, filter used, fell back?). Unfiltered if the filter finds < 3.
+
+    A question naming 2+ insurers gets one search per insurer (retrieve_per_insurer),
+    so one insurer's chunks can't crowd the other's out of the top k.
+    """
+    insurers = insurers_named(question) if use_filter else []
+    if len(insurers) >= 2:
+        results, where = retrieve_per_insurer(question, collection, k, insurers)
+        if len(results) >= MIN_FILTERED:
+            return results, where, False
+        return search(question, collection, k=k), {}, True
     where = question_filter(question) if use_filter else {}
     if where:
         results = search(question, collection, k=k, where=where)
