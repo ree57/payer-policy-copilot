@@ -73,12 +73,17 @@ PROVEN_FOR = re.compile(r"^\w+ is proven (?:and medically necessary )?(?:for|to)
                         r"(?:the treatment of |treat )?(.+)")
 
 # Safe places to cut inside a long policy section: before a new list item.
-# Lower rank = shallower item = better place to cut.
+# Lower rank = shallower item = better place to cut. The ranks follow the
+# usual nesting (1. > A) > i. > a) > (1) > (a)), so a sub-item's parent is the
+# nearest earlier line with a lower rank.
 BREAK_RANKS = [
-    (1, re.compile(r"^(?:[IVX]+|[A-Z])[.)]\s")),                      # II.  A.  B)
-    (2, re.compile(r"^(?:\d{1,2}|[ivx]+)[.)]\s")),                    # 1.  iii.
-    (3, re.compile(r"^(?:[a-z][.)]|\(\d{1,2}\)|\([a-z]\)|[•o▪])(?:\s|$)")),  # a)  (1)  (a)  •
+    (1, re.compile(r"^(?:[IVX]+|[A-Z])[.)]\s")),         # II.  A.  B)
+    (2, re.compile(r"^(?:\d{1,2}|[ivx]+)[.)]\s")),       # 1.  iii.
+    (3, re.compile(r"^(?:[a-z][.)]|[•o▪])(?:\s|$)")),    # a)  •
+    (4, re.compile(r"^\(\d{1,2}\)(?:\s|$)")),            # (1)
+    (5, re.compile(r"^\([a-z]\)(?:\s|$)")),              # (a)
 ]
+SENTENCE_RANK = 6                                        # a new sentence, no list marker
 LONE_MARKER = re.compile(r"^\(?\w{1,4}[.)]$")             # "(1)" alone; its text is on the next line
 
 # --- FDA labels: "1 INDICATIONS AND USAGE", "5.1 Hypersensitivity Reactions" -
@@ -147,11 +152,22 @@ def split_lines(lines, break_rank, name):
 
 
 def overlap_start(lines, start, cut, break_rank):
-    """Where the next piece begins: the earliest safe line within OVERLAP_TOKENS of the cut."""
-    for i in range(start + 1, cut):
-        if break_rank(lines, i) is not None and tokens(join(lines[i:cut])) <= OVERLAP_TOKENS:
-            return i
-    return cut
+    """Where the next piece begins: the earliest safe line within OVERLAP_TOKENS of the cut.
+
+    If that line is a sub-item ("(1)", "a)", "iii."), start at its parent item
+    instead, so the overlap never shows "(1) ... (2) ..." without the line they
+    belong to, as long as the overlap stays within 2 x OVERLAP_TOKENS.
+    """
+    i = next((i for i in range(start + 1, cut) if break_rank(lines, i) is not None
+              and tokens(join(lines[i:cut])) <= OVERLAP_TOKENS), cut)
+    rank = break_rank(lines, i) if i < cut else None
+    if rank is None or not 1 < rank < SENTENCE_RANK:
+        return i
+    for j in range(i - 1, start, -1):                # nearest shallower item = parent
+        parent = break_rank(lines, j)
+        if parent is not None and parent < rank:
+            return j if tokens(join(lines[j:cut])) <= 2 * OVERLAP_TOKENS else i
+    return i
 
 
 def any_break(lines, i):
@@ -168,7 +184,7 @@ def policy_break_rank(lines, i):
         if pattern.match(text):
             return rank
     if re.search(r"(?:[.;:]|\b(?:AND|OR))$", prev) and text[:1].isupper():
-        return 4                                     # a new sentence
+        return SENTENCE_RANK
     return None
 
 

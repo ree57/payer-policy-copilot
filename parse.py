@@ -98,14 +98,19 @@ def find_effective_date(text):
 def find_version_date(text, doc_type, year):
     """Most recent labelled date in the document -> (YYYY-MM-DD, source label).
 
+    A label line can list several dates ("REVIEW DATE: 03/04/2026; selected
+    revision 05/06/2026, 09/09/2026"), so every date on that line counts.
     FDA labels also use their 'Revised: MM/YYYY' line. With no labelled date,
     falls back to the file name's year as (YYYY-01-01, "filename").
     """
     canonical = {label.lower(): label for label in VERSION_LABELS}
     found = []
     for match in VERSION_DATE.finditer(text):
-        if date := to_iso(match.group(2)):
-            found.append((date, canonical[re.sub(r"\s+", " ", match.group(1)).lower()]))
+        line_end = text.find("\n", match.end())
+        rest_of_line = text[match.start():line_end if line_end >= 0 else None]
+        dates = [d for d in map(to_iso, re.findall(DATE, rest_of_line)) if d]
+        if dates:
+            found.append((max(dates), canonical[re.sub(r"\s+", " ", match.group(1)).lower()]))
     if doc_type == "label":
         found += [(f"{y}-{int(m):02d}-01", "Revised") for m, y in FDA_REVISED.findall(text)]
     if found:
