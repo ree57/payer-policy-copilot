@@ -1,0 +1,211 @@
+"""rag.py - Answer coverage questions from the vector store, with citations.
+
+Usage:
+  .venv\\Scripts\\python rag.py "Does Cigna require a statin trial for Repatha?"
+      [--k 8] [--collection section_ctx] [--no-filter]
+
+Retrieves chunks with embed.search(), asks Claude to answer only from them,
+and checks that every [S#] citation points at a retrieved source.
+The API key is read from .env by python-dotenv and never printed.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from collections import defaultdict
+from functools import cache
+from pathlib import Path
+
+import anthropic
+from dotenv import load_dotenv
+
+from embed import COLLECTIONS, search
+
+MODEL = "claude-haiku-5-5"        # small, cheap current model
+EFFORT = "low"                    # Haiku 5.5 rejects temperature; low effort = short, steady answers
+MAX_TOKENS = 2000
+PRICE_PER_MTOK = {"input": 0.10, "output": 0.50}   # USD, claude-haiku-5-5 list price
+DEFAULT_K = 8
+MIN_FILTERED = 3                  # fewer filtered hits than this -> search unfiltered
+
+# Question words -> metadata filters. A field is filtered only when exactly one
+# value matches, so "compare Cigna and Aetna" still searches both.
+FILTER_RULES = [
+    ("source", "cigna", r"\bcigna\b"),
+    ("source", "aetna", r"\baetna\b"),
+    ("source", "uhc", r"\b(?:unitedhealthcare|united healthcare|uhc)\b"),
+    ("drug", "repatha", r"\b(?:repatha|evolocumab)\b"),
+    ("drug", "prolia", r"\b(?:prolia|denosumab)\b"),
+    ("drug", "otezla", r"\b(?:otezla|apremilast)\b"),
+]
+SOURCE_NAMES = {"aetna": "Aetna", "cigna": "Cigna", "uhc": "UnitedHealthcare", "fda": "FDA"}
+
+SYSTEM_PROMPT = """\
+You answer questions about US insurer coverage policies for Repatha, Prolia and Otezla, \
+using only the numbered sources in the user's message.
+
+Rules:
+1. Answer ONLY from the sources. Do not use outside knowledge, even if you believe you know the answer.
+2. Cite every claim with its source number in square brackets, e.g. [S2] or [S1][S4].
+3. If the sources don't answer the question, say so clearly and do not guess.
+4. If the question asks about an insurer, plan or drug that does not appear in any source header, \
+say explicitly that you don't have that insurer's or drug's policy, and list which insurers you do \
+have for that drug, using the document list below. Do not answer from other insurers' policies as \
+a substitute.
+5. For coverage questions, prefer policy and formulary sources over FDA labels, and say which \
+insurer and policy date the answer comes from.
+6. If sources disagree (different insurers or dates), say so rather than merging them.
+7. Keep answers concise. Keep criteria lists in their original AND/OR structure: never turn \
+"all of the following" into "any of the following", or the reverse."""
+
+CITATION = re.compile(r"\[\s*(S\d+(?:\s*[,;]\s*S?\d+)*)\s*\]")
+NO_ANSWER = re.compile(r"\b(?:do not|don't) have\b|not (?:in|found in|covered by|available in) "
+                       r"the (?:provided )?sources|sources (?:do not|don't)", re.I)
+
+
+@cache
+def system_prompt():
+    """SYSTEM_PROMPT plus the list of every document we hold, built from data/chunks.jsonl.
+
+    The list lets the model name the insurers we do have for a drug even when
+    retrieval missed their chunks. It is fixed per run, so the prompt stays cacheable.
+    """
+    with Path(COLLECTIONS["section_ctx"][0]).open(encoding="utf-8") as f:
+        docs = {(SOURCE_NAMES.get(c["source"], c["source"]), c["drug"].capitalize(),
+                 c["doc_type"], c["version_date"]) for c in map(json.loads, f)}
+    lines = [" | ".join(doc) for doc in sorted(docs)]
+    return (SYSTEM_PROMPT + "\n\nDocuments in the knowledge base (insurer | drug | type | version "
+            "date). This list only says what exists; it is not a source and must not be cited:\n"
+            + "\n".join(f"- {line}" for line in lines))
+
+
+@cache
+def raw_texts(collection):
+    """chunk_id -> text_raw for a collection's chunk file (the prompt adds its own header)."""
+    path = COLLECTIONS[collection][0]
+    with Path(path).open(encoding="utf-8") as f:
+        return {c["chunk_id"]: c["text_raw"] for c in map(json.loads, f)}
+
+
+def question_filter(question):
+    """Metadata filter from insurer and drug names in the question, e.g. {"source": "cigna"}."""
+    matches = defaultdict(set)
+    for field, value, pattern in FILTER_RULES:
+        if re.search(pattern, question, re.I):
+            matches[field].add(value)
+    return {field: values.pop() for field, values in matches.items() if len(values) == 1}
+
+
+def retrieve(question, collection, k, use_filter=True):
+    """Top-k chunks -> (results, filter used, fell back?). Unfiltered if the filter finds < 3."""
+    where = question_filter(question) if use_filter else {}
+    if where:
+        results = search(question, collection, k=k, where=where)
+        if len(results) >= MIN_FILTERED:
+            return results, where, False
+    return search(question, collection, k=k), {}, bool(where)
+
+
+def build_prompt(question, results, collection):
+    """Number the chunks [S1]..[Sk] with a header line each, then ask the question."""
+    texts = raw_texts(collection)
+    blocks = []
+    for r in results:
+        m = r["meta"]
+        pages = f"pp. {m['page_start']}-{m['page_end']}" if m["page_end"] != m["page_start"] \
+            else f"p. {m['page_start']}"
+        header = " | ".join([SOURCE_NAMES.get(m["source"], m["source"]), m["drug"].capitalize(),
+                             m["doc_type"], pages, m["version_date"], m["section"] or "-"])
+        blocks.append(f'<source id="S{r["rank"]}">\n{header}\n{texts[r["chunk_id"]]}\n</source>')
+    return "\n\n".join(blocks) + f"\n\nQuestion: {question}"
+
+
+def generate(user_message):
+    """One Claude call -> (answer text, usage). Exits with a clear message on auth errors."""
+    # Puts ANTHROPIC_API_KEY into the environment (never printed). utf-8-sig also reads a
+    # .env saved with a byte-order mark, which PowerShell 5.1 adds by default.
+    load_dotenv(encoding="utf-8-sig")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit("ANTHROPIC_API_KEY not found: .env needs a line ANTHROPIC_API_KEY=<your key>.")
+    client = anthropic.Anthropic()
+    try:
+        response = client.messages.create(
+            model=MODEL, max_tokens=MAX_TOKENS, system=system_prompt(),
+            output_config={"effort": EFFORT},
+            messages=[{"role": "user", "content": user_message}])
+    except anthropic.AuthenticationError:
+        sys.exit("API key rejected (authentication error): check ANTHROPIC_API_KEY in .env.")
+    except anthropic.RateLimitError:
+        sys.exit("Rate limited by the API; try again in a minute.")
+    except anthropic.APIConnectionError:
+        sys.exit("Could not reach the Anthropic API; check the network connection.")
+    if response.stop_reason == "refusal":
+        return "[The model declined to answer this question.]", response.usage
+    answer = "".join(block.text for block in response.content if block.type == "text")
+    if response.stop_reason == "max_tokens":
+        answer += "\n[Answer cut off at MAX_TOKENS.]"
+    return answer.strip(), response.usage
+
+
+def check_citations(answer, n_sources):
+    """-> (cited source numbers, invalid citations, uncited-claims warning or None)."""
+    cited, invalid = set(), []
+    for group in CITATION.findall(answer):
+        for number in map(int, re.findall(r"\d+", group)):
+            if 1 <= number <= n_sources:
+                cited.add(number)
+            else:
+                invalid.append(f"S{number}")
+    warning = None
+    if not cited and not NO_ANSWER.search(answer):
+        warning = "answer has no citations and doesn't say the sources lack the answer"
+    return cited, invalid, warning
+
+
+def ask(question, k=DEFAULT_K, collection="section_ctx", use_filter=True):
+    """Retrieve, generate and check one question. Returns a dict with everything to report."""
+    results, where, fell_back = retrieve(question, collection, k, use_filter)
+    answer, usage = generate(build_prompt(question, results, collection))
+    cited, invalid, warning = check_citations(answer, len(results))
+    cost = (usage.input_tokens * PRICE_PER_MTOK["input"]
+            + usage.output_tokens * PRICE_PER_MTOK["output"]) / 1_000_000
+    return {"question": question, "answer": answer, "sources": results, "where": where,
+            "fell_back": fell_back, "cited": cited, "invalid_citations": invalid,
+            "warning": warning, "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens, "cost_usd": cost}
+
+
+def print_result(result):
+    """Answer, then the sources list, citation check and token cost."""
+    print(result["answer"])
+    print("\nSources:")
+    for r in result["sources"]:
+        m = r["meta"]
+        mark = "cited" if r["rank"] in result["cited"] else "     "
+        print(f"  [S{r['rank']}] {mark}  {r['chunk_id']:<28} pp. {m['page_start']}-{m['page_end']:<4} "
+              f"{m['version_date']}")
+    filt = result["where"] or "none"
+    print(f"\nFilter: {filt}" + ("  (filtered search found < 3, fell back to unfiltered)"
+                                 if result["fell_back"] else ""))
+    if result["invalid_citations"]:
+        print(f"WARNING: citations not in the retrieved set: {result['invalid_citations']}")
+    if result["warning"]:
+        print(f"WARNING: {result['warning']}")
+    print(f"Tokens: {result['input_tokens']} in / {result['output_tokens']} out, "
+          f"${result['cost_usd']:.5f}")
+
+
+def main():
+    """CLI entry point."""
+    parser = argparse.ArgumentParser(description="Answer a coverage question with citations.")
+    parser.add_argument("question")
+    parser.add_argument("--k", type=int, default=DEFAULT_K)
+    parser.add_argument("--collection", choices=COLLECTIONS, default="section_ctx")
+    parser.add_argument("--no-filter", action="store_true", help="skip the insurer/drug filter")
+    args = parser.parse_args()
+    print_result(ask(args.question, args.k, args.collection, not args.no_filter))
+
+
+if __name__ == "__main__":
+    main()

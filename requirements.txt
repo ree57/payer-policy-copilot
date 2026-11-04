@@ -7,3 +7,5 @@ transformers==4.57.6
 sentence-transformers==5.7.0
 einops==0.8.2
 chromadb==1.5.9
+anthropic==2.4.0
+python-dotenv==1.2.4

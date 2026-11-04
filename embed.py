@@ -87,7 +87,7 @@ def build_collection(name, path, field):
 
 
 def search(question, collection, k=5, where=None):
-    """Top-k chunks for a question: list of dicts with rank, score, chunk_id, section, text.
+    """Top-k chunks for a question: dicts with rank, score, chunk_id, section, text, meta.
 
     `where` is a metadata filter like {"source": "cigna", "doc_type": "policy"};
     several keys are combined with AND. Score is cosine similarity (1 = same direction).
@@ -100,7 +100,7 @@ def search(question, collection, k=5, where=None):
     result = coll.query(query_embeddings=query.tolist(), n_results=k, where=where,
                         include=["documents", "metadatas", "distances"])
     return [{"rank": rank, "score": 1 - distance, "chunk_id": chunk_id,
-             "section": meta["section"], "text": doc}
+             "section": meta["section"], "text": doc, "meta": meta}
             for rank, (chunk_id, doc, meta, distance) in enumerate(
                 zip(result["ids"][0], result["documents"][0], result["metadatas"][0],
                     result["distances"][0]), start=1)]
