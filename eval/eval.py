@@ -27,6 +27,8 @@ QUESTIONS_PATH = Path("eval/questions.jsonl")
 RESULTS_DIR = Path("eval/results")
 KS = (3, 5, 8)
 MAIN_SETUP = ("section_ctx", True)            # collection, filter on: what the chatbot uses
+SETUPS = [(c, f, False) for c in COLLECTIONS for f in (True, False)]   # (collection, filter, rerank)
+RERANK_SETUP = ("section_ctx", True, True)    # added with --rerank
 
 JUDGE_MODEL = "claude-opus-5-5"               # stronger than the answering model (rag.MODEL)
 JUDGE_EFFORT = "medium"
@@ -74,8 +76,8 @@ def evidence_ranks(results, evidence):
             for e in evidence]
 
 
-def score_retrieval(questions):
-    """Every answerable question x collection x filter on/off -> one row of ranks and metrics.
+def score_retrieval(questions, setups):
+    """Every answerable question x setup (collection, filter, rerank) -> ranks and metrics.
 
     Each k gets its own retrieval rather than the first k of a k=8 list: per-insurer
     retrieval splits k between insurers, so the top 3 of a k=8 list is not what k=3 returns.
@@ -83,22 +85,22 @@ def score_retrieval(questions):
     """
     rows = []
     for q in (q for q in questions if q["answerable"]):
-        for collection in COLLECTIONS:
-            for use_filter in (True, False):
-                metrics = {}
-                for k in KS:
-                    if use_filter:
-                        results, where, fell_back = rag.retrieve(q["question"], collection, k)
-                    else:
-                        results, where, fell_back = search(q["question"], collection, k=k), {}, False
-                    ranks = evidence_ranks(results, q["evidence"])
-                    found = [r for r in ranks if r is not None]
-                    metrics[f"hit@{k}"] = float(bool(found))
-                    metrics[f"recall@{k}"] = len(found) / len(ranks)
-                metrics["rr"] = 1 / min(found) if found else 0.0   # k = max(KS), the last run
-                rows.append({"id": q["id"], "category": q["category"], "collection": collection,
-                             "filter": use_filter, "where": where, "fell_back": fell_back,
-                             "ranks": ranks, **metrics})
+        for collection, use_filter, use_rerank in setups:
+            metrics = {}
+            for k in KS:
+                if use_filter:
+                    results, where, fell_back = rag.retrieve(q["question"], collection, k,
+                                                             use_rerank=use_rerank)
+                else:
+                    results, where, fell_back = search(q["question"], collection, k=k), {}, False
+                ranks = evidence_ranks(results, q["evidence"])
+                found = [r for r in ranks if r is not None]
+                metrics[f"hit@{k}"] = float(bool(found))
+                metrics[f"recall@{k}"] = len(found) / len(ranks)
+            metrics["rr"] = 1 / min(found) if found else 0.0   # k = max(KS), the last run
+            rows.append({"id": q["id"], "category": q["category"], "collection": collection,
+                         "filter": use_filter, "rerank": use_rerank, "where": where,
+                         "fell_back": fell_back, "ranks": ranks, **metrics})
     return rows
 
 
@@ -122,13 +124,14 @@ def judge(client, q, result):
     return verdict, response.usage
 
 
-def score_answers(questions):
+def score_answers(questions, use_rerank=False):
     """Answer every question with rag.ask() (main setup), judge it, and label failures."""
     load_dotenv(encoding="utf-8-sig")             # ANTHROPIC_API_KEY; never printed
     client = anthropic.Anthropic()
     rows = []
     for q in questions:
-        result = rag.ask(q["question"], k=max(KS), collection=MAIN_SETUP[0], use_filter=MAIN_SETUP[1])
+        result = rag.ask(q["question"], k=max(KS), collection=MAIN_SETUP[0],
+                         use_filter=MAIN_SETUP[1], use_rerank=use_rerank)
         try:
             verdict, usage = judge(client, q, result)
         except anthropic.AuthenticationError:
@@ -151,7 +154,8 @@ def score_answers(questions):
                      "answer_tokens": [result["input_tokens"], result["output_tokens"]],
                      "answer_cost_usd": result["cost_usd"],
                      "judge_tokens": [usage.input_tokens, usage.output_tokens],
-                     "judge_cost_usd": judge_cost})
+                     "judge_cost_usd": judge_cost, "rerank": use_rerank,
+                     "seconds": result["seconds"]})
         print(f"  {q['id']} {verdict['grade']:<18} {failure or '':<10} {verdict['reason'][:70]}")
     return rows
 
@@ -163,22 +167,23 @@ def mean(values):
 
 def retrieval_tables(rows):
     """Markdown: overall metrics per setup, then hit@8 / MRR per category per setup."""
-    setups = [(c, f) for c in COLLECTIONS for f in (True, False)]
-    name = lambda c, f: f"{c} ({'filter' if f else 'no filter'})"
+    setup_of = lambda r: (r["collection"], r["filter"], r.get("rerank", False))
+    setups = list(dict.fromkeys(setup_of(r) for r in rows))          # in run order
+    name = lambda c, f, rr: f"{c} ({'filter' if f else 'no filter'}{' + rerank' if rr else ''})"
     cols = [f"hit@{k}" for k in KS] + [f"recall@{k}" for k in KS] + ["MRR"]
     lines = ["| setup | " + " | ".join(cols) + " |", "|---" * (len(cols) + 1) + "|"]
-    for c, f in setups:
-        sel = [r for r in rows if r["collection"] == c and r["filter"] == f]
+    for s in setups:
+        sel = [r for r in rows if setup_of(r) == s]
         vals = [mean([r[m] for r in sel]) for m in cols[:-1]] + [mean([r["rr"] for r in sel])]
-        lines.append(f"| {name(c, f)} | " + " | ".join(f"{v:.2f}" for v in vals) + " |")
+        lines.append(f"| {name(*s)} | " + " | ".join(f"{v:.2f}" for v in vals) + " |")
     cats = sorted({r["category"] for r in rows})
     lines += ["", "hit@8 / MRR per category:", "",
-              "| category (n) | " + " | ".join(name(c, f) for c, f in setups) + " |",
+              "| category (n) | " + " | ".join(name(*s) for s in setups) + " |",
               "|---" * (len(setups) + 1) + "|"]
     for cat in cats:
         cells = []
-        for c, f in setups:
-            sel = [r for r in rows if r["collection"] == c and r["filter"] == f and r["category"] == cat]
+        for s in setups:
+            sel = [r for r in rows if setup_of(r) == s and r["category"] == cat]
             cells.append(f"{mean([r['hit@8'] for r in sel]):.2f} / {mean([r['rr'] for r in sel]):.2f}")
         n = len({r["id"] for r in rows if r["category"] == cat})
         lines.append(f"| {cat} ({n}) | " + " | ".join(cells) + " |")
@@ -236,21 +241,25 @@ def main():
     parser.add_argument("--retrieval-only", action="store_true", help="skip API calls")
     parser.add_argument("--limit", type=int, help="only the first N questions")
     parser.add_argument("--seed", type=int, default=7, help="seed for the judge spot-check")
+    parser.add_argument("--rerank", action="store_true",
+                        help=f"add a re-ranked retrieval setup and answer with re-ranking ({rag.RERANK_MODEL})")
     args = parser.parse_args()
 
     questions = load_questions(args.limit)
     out = RESULTS_DIR / datetime.now().strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True)
     print(f"Scoring retrieval for {sum(q['answerable'] for q in questions)} answerable questions...")
-    retrieval = score_retrieval(questions)
+    retrieval = score_retrieval(questions, SETUPS + ([RERANK_SETUP] if args.rerank else []))
     write_jsonl(out / "retrieval.jsonl", retrieval)
+    rerank_note = f" + {rag.RERANK_MODEL} re-ranking of {rag.RERANK_CANDIDATES}" if args.rerank else ""
     report = [f"# Evaluation run {out.name}", "",
               f"{len(questions)} questions ({sum(not q['answerable'] for q in questions)} unanswerable). "
-              f"Answers: {rag.MODEL} on {MAIN_SETUP[0]}, filter on, k={max(KS)}. Judge: {JUDGE_MODEL}.",
+              f"Answers: {rag.MODEL} on {MAIN_SETUP[0]}, filter on{rerank_note}, k={max(KS)}. "
+              f"Judge: {JUDGE_MODEL}.",
               "", "## Retrieval (answerable questions only)", "", retrieval_tables(retrieval)]
     if not args.retrieval_only:
         print(f"Answering and judging {len(questions)} questions...")
-        answers = score_answers(questions)
+        answers = score_answers(questions, use_rerank=args.rerank)
         write_jsonl(out / "answers.jsonl", answers)
         report += ["", "## Answers (main setup)", "", answer_tables(answers),
                    "", "## API cost", "", cost_table(answers),

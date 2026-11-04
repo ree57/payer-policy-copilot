@@ -2,7 +2,7 @@
 
 Usage:
   .venv\\Scripts\\python rag.py "Does Cigna require a statin trial for Repatha?"
-      [--k 8] [--collection section_ctx] [--no-filter]
+      [--k 8] [--collection section_ctx] [--no-filter] [--rerank]
 
 Retrieves chunks with embed.search(), asks Claude to answer only from them,
 and checks that every [S#] citation points at a retrieved source.
@@ -13,6 +13,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 from functools import cache
 from pathlib import Path
@@ -28,6 +29,9 @@ MAX_TOKENS = 2000
 PRICE_PER_MTOK = {"input": 0.10, "output": 0.50}   # USD, claude-haiku-5-5 list price
 DEFAULT_K = 8
 MIN_FILTERED = 3                  # fewer filtered hits than this -> search unfiltered
+RERANK_MODEL = "BAAI/bge-reranker-v2-m3"   # 1 of 389 question+chunk pairs exceeds 1024 tokens
+RERANK_MAX_LENGTH = 1024
+RERANK_CANDIDATES = 25            # embedding hits per filter that the re-ranker re-orders
 
 # Question words -> metadata filters. A field is filtered only when exactly one
 # value matches, so "compare Cigna and Aetna" still searches both.
@@ -105,17 +109,49 @@ def insurers_named(question):
             if field == "source" and re.search(pattern, question, re.I)]
 
 
-def retrieve_per_insurer(question, collection, k, insurers):
+@cache
+def load_reranker():
+    """The cross-encoder, loaded once (about 2.3 GB on first download)."""
+    from sentence_transformers import CrossEncoder
+    return CrossEncoder(RERANK_MODEL, max_length=RERANK_MAX_LENGTH)
+
+
+_rerank_scores = {}  # (question, chunk_id) -> cross-encoder score, so repeated k's don't re-score
+
+
+def rerank(question, candidates, keep):
+    """Re-order candidates by cross-encoder relevance to the question; keep the top `keep`."""
+    new = [r for r in candidates if (question, r["chunk_id"]) not in _rerank_scores]
+    if new:
+        scores = load_reranker().predict([(question, r["text"]) for r in new], batch_size=8)
+        for r, score in zip(new, scores):
+            _rerank_scores[(question, r["chunk_id"])] = float(score)
+    ranked = sorted(candidates, key=lambda r: _rerank_scores[(question, r["chunk_id"])],
+                    reverse=True)[:keep]
+    for rank, r in enumerate(ranked, start=1):
+        r["rank"], r["rerank_score"] = rank, _rerank_scores[(question, r["chunk_id"])]
+    return ranked
+
+
+def ranked_search(question, collection, k, where=None, use_rerank=False):
+    """search(), or with use_rerank: RERANK_CANDIDATES candidates re-ranked down to k."""
+    if not use_rerank:
+        return search(question, collection, k=k, where=where)
+    return rerank(question, search(question, collection, k=RERANK_CANDIDATES, where=where), k)
+
+
+def retrieve_per_insurer(question, collection, k, insurers, use_rerank=False):
     """Comparison questions: one filtered search per insurer with k split evenly, then merged.
 
     Each insurer gets k // n slots (the first k % n insurers one extra) and keeps any
     drug filter; results stay grouped by insurer and are renumbered 1..k for the prompt.
+    With use_rerank, each insurer's candidates are re-ranked within that insurer.
     """
     base = question_filter(question)                 # drops "source" when 2+ insurers match
     merged, seen = [], set()
     for i, insurer in enumerate(insurers):
         share = k // len(insurers) + (i < k % len(insurers))
-        for r in search(question, collection, k=share, where={**base, "source": insurer}):
+        for r in ranked_search(question, collection, share, {**base, "source": insurer}, use_rerank):
             if r["chunk_id"] not in seen:
                 seen.add(r["chunk_id"])
                 merged.append(r)
@@ -124,24 +160,25 @@ def retrieve_per_insurer(question, collection, k, insurers):
     return merged, {**base, "source": insurers}
 
 
-def retrieve(question, collection, k, use_filter=True):
+def retrieve(question, collection, k, use_filter=True, use_rerank=False):
     """Top-k chunks -> (results, filter used, fell back?). Unfiltered if the filter finds < 3.
 
     A question naming 2+ insurers gets one search per insurer (retrieve_per_insurer),
-    so one insurer's chunks can't crowd the other's out of the top k.
+    so one insurer's chunks can't crowd the other's out of the top k. use_rerank
+    re-ranks RERANK_CANDIDATES embedding hits with a cross-encoder before keeping k.
     """
     insurers = insurers_named(question) if use_filter else []
     if len(insurers) >= 2:
-        results, where = retrieve_per_insurer(question, collection, k, insurers)
+        results, where = retrieve_per_insurer(question, collection, k, insurers, use_rerank)
         if len(results) >= MIN_FILTERED:
             return results, where, False
-        return search(question, collection, k=k), {}, True
+        return ranked_search(question, collection, k, None, use_rerank), {}, True
     where = question_filter(question) if use_filter else {}
     if where:
-        results = search(question, collection, k=k, where=where)
+        results = ranked_search(question, collection, k, where, use_rerank)
         if len(results) >= MIN_FILTERED:
             return results, where, False
-    return search(question, collection, k=k), {}, bool(where)
+    return ranked_search(question, collection, k, None, use_rerank), {}, bool(where)
 
 
 def build_prompt(question, results, collection):
@@ -200,17 +237,20 @@ def check_citations(answer, n_sources):
     return cited, invalid, warning
 
 
-def ask(question, k=DEFAULT_K, collection="section_ctx", use_filter=True):
+def ask(question, k=DEFAULT_K, collection="section_ctx", use_filter=True, use_rerank=False):
     """Retrieve, generate and check one question. Returns a dict with everything to report."""
-    results, where, fell_back = retrieve(question, collection, k, use_filter)
+    start = time.perf_counter()
+    results, where, fell_back = retrieve(question, collection, k, use_filter, use_rerank)
+    retrieved = time.perf_counter()
     answer, usage = generate(build_prompt(question, results, collection))
+    seconds = {"retrieve": retrieved - start, "answer": time.perf_counter() - retrieved}
     cited, invalid, warning = check_citations(answer, len(results))
     cost = (usage.input_tokens * PRICE_PER_MTOK["input"]
             + usage.output_tokens * PRICE_PER_MTOK["output"]) / 1_000_000
     return {"question": question, "answer": answer, "sources": results, "where": where,
             "fell_back": fell_back, "cited": cited, "invalid_citations": invalid,
             "warning": warning, "input_tokens": usage.input_tokens,
-            "output_tokens": usage.output_tokens, "cost_usd": cost}
+            "output_tokens": usage.output_tokens, "cost_usd": cost, "seconds": seconds}
 
 
 def print_result(result):
@@ -240,8 +280,9 @@ def main():
     parser.add_argument("--k", type=int, default=DEFAULT_K)
     parser.add_argument("--collection", choices=COLLECTIONS, default="section_ctx")
     parser.add_argument("--no-filter", action="store_true", help="skip the insurer/drug filter")
+    parser.add_argument("--rerank", action="store_true", help=f"re-rank with {RERANK_MODEL}")
     args = parser.parse_args()
-    print_result(ask(args.question, args.k, args.collection, not args.no_filter))
+    print_result(ask(args.question, args.k, args.collection, not args.no_filter, args.rerank))
 
 
 if __name__ == "__main__":

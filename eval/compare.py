@@ -19,11 +19,17 @@ METRICS = [f"hit@{k}" for k in KS] + [f"recall@{k}" for k in KS] + ["rr"]
 GOOD = {"correct", "correctly_refused"}
 
 
+def run_setup(run):
+    """(collection, filter, rerank) the run's answers used; older runs had no re-ranking."""
+    with (Path(run) / "answers.jsonl").open(encoding="utf-8") as f:
+        return (*MAIN_SETUP, json.loads(f.readline()).get("rerank", False))
+
+
 def load(run, name):
-    """Rows of a run's JSONL file, keyed by question id (retrieval: main setup only)."""
+    """Rows of a run's JSONL file, keyed by question id (retrieval: the answering setup only)."""
     rows = [json.loads(line) for line in (Path(run) / name).open(encoding="utf-8")]
     if name == "retrieval.jsonl":
-        rows = [r for r in rows if (r["collection"], r["filter"]) == MAIN_SETUP]
+        rows = [r for r in rows if (r["collection"], r["filter"], r.get("rerank", False)) == run_setup(run)]
     return {r["id"]: r for r in rows}
 
 
@@ -41,7 +47,8 @@ def main():
 
     head = "| run | " + " | ".join(m.replace("rr", "MRR") for m in METRICS) + " |"
     lines = [f"# Comparison: {Path(base).name} -> {Path(new).name}", "",
-             f"Main setup: {MAIN_SETUP[0]}, filter on, k={max(KS)}.", "",
+             f"Answering setup (collection, filter, rerank): before {run_setup(base)}, "
+             f"after {run_setup(new)}; k={max(KS)}.", "",
              "## Retrieval, all answerable questions", "", head, "|---" * (len(METRICS) + 1) + "|",
              metric_row("before", rb.values()), metric_row("after", rn.values())]
     for cat in sorted({r["category"] for r in rn.values()}):

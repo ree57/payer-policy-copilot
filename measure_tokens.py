@@ -5,6 +5,7 @@ this checks how many chunks would lose their tail before choosing a model.
 Counts include the document prefix each model expects.
 """
 import json
+import sys
 from pathlib import Path
 from statistics import median
 
@@ -15,6 +16,10 @@ CANDIDATES = {
     "BAAI/bge-small-en-v1.5": ("", 512),
     "nomic-ai/nomic-embed-text-v1.5": ("search_document: ", 8192),
 }
+RERANKERS = {  # cross-encoder candidates: max input length of the (question, chunk) pair
+    "BAAI/bge-reranker-base": 512,
+    "BAAI/bge-reranker-v2-m3": 8192,
+}
 INPUTS = [  # (label, file, field), matching the three planned collections
     ("section_ctx", "data/chunks.jsonl", "text"),
     ("section_raw", "data/chunks.jsonl", "text_raw"),
@@ -22,8 +27,29 @@ INPUTS = [  # (label, file, field), matching the three planned collections
 ]
 
 
+def measure_rerankers():
+    """Token counts of (longest test question, chunk text) pairs, as a cross-encoder reads them."""
+    questions = [json.loads(line)["question"] for line in Path("eval/questions.jsonl").open(encoding="utf-8")]
+    question = max(questions, key=len)
+    chunks = [json.loads(line) for line in Path("data/chunks.jsonl").open(encoding="utf-8")]
+    print(f"Pairs of the longest test question ({len(question)} chars) with each section_ctx chunk `text`")
+    for model, max_len in RERANKERS.items():
+        tokenizer = AutoTokenizer.from_pretrained(model)
+        counts = [len(ids) for ids in tokenizer([question] * len(chunks),
+                                                [c["text"] for c in chunks])["input_ids"]]
+        over = [n for n in counts if n > max_len]
+        over_512 = [n for n in counts if n > 512]
+        print(f"\n{model}  (max {max_len})")
+        print(f"  pairs {len(counts)}  min {min(counts)}  median {median(counts):.0f}  max {max(counts)}  "
+              f"over max: {len(over)} ({len(over) / len(counts):.0%})  over 512: {len(over_512)} "
+              f"({len(over_512) / len(counts):.0%})")
+
+
 def main():
     """Print token stats and over-limit counts per model and collection."""
+    if "--rerankers" in sys.argv:
+        measure_rerankers()
+        return
     for model, (prefix, max_len) in CANDIDATES.items():
         tokenizer = AutoTokenizer.from_pretrained(model)
         print(f"\n{model}  (max {max_len} tokens, prefix {prefix!r})")
