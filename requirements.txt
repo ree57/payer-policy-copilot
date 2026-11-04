@@ -1,0 +1,9 @@
+# Python 3.14, CPU. Install into .venv:  py -m venv .venv && .venv\Scripts\python -m pip install -r requirements.txt
+pymupdf==2.1
+torch==2.15.0
+# nomic-embed-text-v1.5's own model code calls an API removed in transformers 5,
+# so transformers stays on 4.x and sentence-transformers on the 5.x line that supports it.
+transformers==4.57.6
+sentence-transformers==5.7.0
+einops==0.8.2
+chromadb==1.5.9
