@@ -130,8 +130,11 @@ def score_answers(questions, use_rerank=False):
     client = anthropic.Anthropic()
     rows = []
     for q in questions:
-        result = rag.ask(q["question"], k=max(KS), collection=MAIN_SETUP[0],
-                         use_filter=MAIN_SETUP[1], use_rerank=use_rerank)
+        try:
+            result = rag.ask(q["question"], k=max(KS), collection=MAIN_SETUP[0],
+                             use_filter=MAIN_SETUP[1], use_rerank=use_rerank)
+        except rag.AnswerError as e:
+            sys.exit(str(e))
         try:
             verdict, usage = judge(client, q, result)
         except anthropic.AuthenticationError:

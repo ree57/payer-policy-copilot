@@ -71,19 +71,28 @@ NO_ANSWER = re.compile(r"\b(?:do not|don't) have\b|not (?:in|found in|covered by
 
 
 @cache
+class AnswerError(Exception):
+    """A problem getting an answer from the API; the message is safe to show a user."""
+
+
+@cache
+def document_list():
+    """Every document we hold as sorted (insurer, drug, type, version date), from data/chunks.jsonl."""
+    with Path(COLLECTIONS["section_ctx"][0]).open(encoding="utf-8") as f:
+        return sorted({(SOURCE_NAMES.get(c["source"], c["source"]), c["drug"].capitalize(),
+                        c["doc_type"], c["version_date"]) for c in map(json.loads, f)})
+
+
+@cache
 def system_prompt():
-    """SYSTEM_PROMPT plus the list of every document we hold, built from data/chunks.jsonl.
+    """SYSTEM_PROMPT plus the document list.
 
     The list lets the model name the insurers we do have for a drug even when
     retrieval missed their chunks. It is fixed per run, so the prompt stays cacheable.
     """
-    with Path(COLLECTIONS["section_ctx"][0]).open(encoding="utf-8") as f:
-        docs = {(SOURCE_NAMES.get(c["source"], c["source"]), c["drug"].capitalize(),
-                 c["doc_type"], c["version_date"]) for c in map(json.loads, f)}
-    lines = [" | ".join(doc) for doc in sorted(docs)]
     return (SYSTEM_PROMPT + "\n\nDocuments in the knowledge base (insurer | drug | type | version "
             "date). This list only says what exists; it is not a source and must not be cited:\n"
-            + "\n".join(f"- {line}" for line in lines))
+            + "\n".join(f"- {' | '.join(doc)}" for doc in document_list()))
 
 
 @cache
@@ -196,12 +205,13 @@ def build_prompt(question, results, collection):
 
 
 def generate(user_message):
-    """One Claude call -> (answer text, usage). Exits with a clear message on auth errors."""
+    """One Claude call -> (answer text, usage). Raises AnswerError with a user-safe message."""
     # Puts ANTHROPIC_API_KEY into the environment (never printed). utf-8-sig also reads a
     # .env saved with a byte-order mark, which PowerShell 5.1 adds by default.
     load_dotenv(encoding="utf-8-sig")
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        sys.exit("ANTHROPIC_API_KEY not found: .env needs a line ANTHROPIC_API_KEY=<your key>.")
+        raise AnswerError("ANTHROPIC_API_KEY not found: set it in .env locally, "
+                          "or in Streamlit secrets when deployed.")
     client = anthropic.Anthropic()
     try:
         response = client.messages.create(
@@ -209,11 +219,14 @@ def generate(user_message):
             output_config={"effort": EFFORT},
             messages=[{"role": "user", "content": user_message}])
     except anthropic.AuthenticationError:
-        sys.exit("API key rejected (authentication error): check ANTHROPIC_API_KEY in .env.")
+        raise AnswerError("The API key was rejected (authentication error).") from None
     except anthropic.RateLimitError:
-        sys.exit("Rate limited by the API; try again in a minute.")
+        raise AnswerError("Rate limited by the API; try again in a minute.") from None
     except anthropic.APIConnectionError:
-        sys.exit("Could not reach the Anthropic API; check the network connection.")
+        raise AnswerError("Could not reach the Anthropic API; check the network connection.") from None
+    except anthropic.APIStatusError as e:
+        raise AnswerError(f"The Anthropic API returned an error (status {e.status_code}); "
+                          "try again shortly.") from None
     if response.stop_reason == "refusal":
         return "[The model declined to answer this question.]", response.usage
     answer = "".join(block.text for block in response.content if block.type == "text")
@@ -282,7 +295,10 @@ def main():
     parser.add_argument("--no-filter", action="store_true", help="skip the insurer/drug filter")
     parser.add_argument("--rerank", action="store_true", help=f"re-rank with {RERANK_MODEL}")
     args = parser.parse_args()
-    print_result(ask(args.question, args.k, args.collection, not args.no_filter, args.rerank))
+    try:
+        print_result(ask(args.question, args.k, args.collection, not args.no_filter, args.rerank))
+    except AnswerError as e:
+        sys.exit(str(e))
 
 
 if __name__ == "__main__":
