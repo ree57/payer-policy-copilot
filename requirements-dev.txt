@@ -1,0 +1,4 @@
+# Full local toolchain: the app's runtime plus parse.py (PDF parsing) and the eval timing tools.
+-r requirements.txt
+pymupdf==2.1
+psutil==7.2.2

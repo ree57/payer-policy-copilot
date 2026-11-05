@@ -23,7 +23,7 @@ rag = None   # imported in main() after the password gate: it loads torch (~30 s
 
 COLLECTION = "section_ctx"
 SETTINGS = ["ANTHROPIC_API_KEY", "APP_PASSWORD", "HF_TOKEN"]
-DATA_REPO = os.environ.get("DATA_REPO", "")       # set in the Space's Dockerfile
+DATA_REPO = os.environ.get("DATA_REPO", "ree57/payer-policy-copilot-data")   # private HF dataset
 DATA_FILES = [Path("chroma_db/chroma.sqlite3"), Path("data/chunks.jsonl")]
 MAX_PASSWORD_ATTEMPTS = 5
 WRONG_PASSWORD_DELAY = 2                          # seconds, to slow down guessing

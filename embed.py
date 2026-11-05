@@ -7,9 +7,15 @@ Builds three collections in chroma_db/ so Day 2 can compare them:
 then runs a few test searches against section_ctx.
 """
 import json
+import sqlite3
+import sys
 import time
 from functools import cache
 from pathlib import Path
+
+if sqlite3.sqlite_version_info < (3, 35, 0):    # chromadb needs >= 3.35; Debian 11 ships 3.34
+    import pysqlite3                             # pysqlite3-binary (Linux-only requirement)
+    sys.modules["sqlite3"] = pysqlite3
 
 import chromadb
 from chromadb.errors import NotFoundError

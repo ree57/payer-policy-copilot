@@ -1,14 +1,19 @@
-# Python 3.14, CPU. Install into .venv:  py -m venv .venv && .venv\Scripts\python -m pip install -r requirements.txt
-pymupdf==2.1
-torch==2.15.0
+# App runtime: what app.py needs. Streamlit Community Cloud installs this file
+# (Python 3.12 there; 3.14 locally). For parse.py and the eval tools, use requirements-dev.txt.
+# Local setup:  py -m venv .venv && .venv\Scripts\python -m pip install -r requirements-dev.txt
+
+# CPU-only PyTorch: the default Linux wheel bundles CUDA and is several GB.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
 # nomic-embed-text-v1.5's own model code calls an API removed in transformers 5,
 # so transformers stays on 4.x and sentence-transformers on the 5.x line that supports it.
 transformers==4.57.6
 sentence-transformers==5.7.0
 einops==0.8.2
 chromadb==1.5.9
+# chromadb needs SQLite >= 3.35; Community Cloud's Debian 11 base has 3.34 (see embed.py).
+pysqlite3-binary==0.5.4.post2; platform_system == "Linux"
 anthropic==2.4.0
 python-dotenv==1.2.4
 streamlit==1.66.1
-# measurement tools only (eval/timing.py, eval/rerank_probe.py)
-psutil==7.2.2
+huggingface_hub==0.36.2
