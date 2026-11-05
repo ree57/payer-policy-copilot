@@ -19,7 +19,7 @@ flowchart LR
 - **parse:** page text via PyMuPDF; repeated headers/footers removed by frequency; version dates recorded.
 - **chunk:** split at the policies' own headings, AND/OR criteria kept together, formulary rows rebuilt as sentences.
 - **embed:** `nomic-ai/nomic-embed-text-v1.5` (chosen because 43% of chunks exceeded bge-small's 512-token limit) into Chroma.
-- **retrieve:** top 8, filtered by the insurer and drug named in the question.
+- **retrieve:** top 8, filtered by the insurer and drug named in the question; questions naming 2+ insurers or drugs get one search per insurer/drug.
 - **generate:** Claude Haiku 5.5 answers only from numbered sources; code checks every `[S#]` citation.
 
 ## Evaluation
@@ -43,6 +43,9 @@ drug label, so a drug filter would penalise it for a labelling reason, not its c
 |---|---|---|---|---|---|---|
 | 25 questions | 17 | 2 | 1 | 4 of 4 | 1 | **0** |
 
+The set was later extended to 27 questions with 2 drug-comparison questions
+([`eval/results/20261105-224643/`](eval/results/20261105-224643/)); the original 25 kept identical grades.
+
 Three of the four failures are retrieval misses where the model said the sources didn't cover
 the point; the fourth is an ambiguous question. Cost per answer is about $0.0009 (Haiku);
 median end-to-end time is 3.4 s on a local CPU. Results: `eval/results/20261104-205239/`.
@@ -53,11 +56,12 @@ median end-to-end time is 3.4 s on a local CPU. Results: `eval/results/20261104-
 |---|---|---|
 | Per-insurer retrieval for comparisons | Comparison recall@3 0.33 → 0.50, recall@8 unchanged at 0.50, no grade changes: the right chunks rank too low *within* each insurer. | Kept |
 | Cross-encoder re-ranker (`bge-reranker-v2-m3`) | q04 evidence 1/3 → 2/3, q17 0/2 → 1/2, q19 1/2 → 0/2; 42-73 s per query on CPU, peak memory 1.6 → 2.9 GB. | Off (behind a flag) |
+| Per-drug retrieval (bug found testing the live app) | "Repatha vs Prolia" retrieved only Prolia chunks, because 2 named drugs disabled the drug filter; now 4 + 4 per drug. All 25 original questions unchanged; 2 new drug-comparison questions added (both partly, evidence recall@8 0.00 and 0.33: ranking within each label). | Kept |
 
 ## Limitations and next steps
 
 - **Small test set:** one of 21 answerable questions is about 5 points; a larger held-out set is next.
-- **Ranking in long documents:** remaining misses rank 5-21; try a faster re-ranker or hybrid keyword search.
+- **Ranking in long documents:** remaining misses rank 5-21, which also explains the two partial drug-comparison answers; try a faster re-ranker or hybrid keyword search.
 - **Coverage:** Aetna's Otezla policy is from 2024 and its Repatha policy from 2025; no UHC Repatha policy.
 - **No follow-up memory** (each question stands alone), and free hosting is slow to wake.
 
