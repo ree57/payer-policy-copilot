@@ -44,6 +44,10 @@ def main():
     rb, rn = load(base, "retrieval.jsonl"), load(new, "retrieval.jsonl")
     ab, an = load(base, "answers.jsonl"), load(new, "answers.jsonl")
     questions = {q["id"]: q for q in map(json.loads, QUESTIONS_PATH.open(encoding="utf-8"))}
+    # Before/after numbers cover only the questions both runs answered; added ones are listed apart.
+    added = [i for i in an if i not in ab]
+    rn = {i: r for i, r in rn.items() if i in rb}
+    an_all, an = an, {i: r for i, r in an.items() if i in ab}
 
     head = "| run | " + " | ".join(m.replace("rr", "MRR") for m in METRICS) + " |"
     lines = [f"# Comparison: {Path(base).name} -> {Path(new).name}", "",
@@ -71,13 +75,20 @@ def main():
     for i in an:
         if ab[i]["grade"] == an[i]["grade"]:
             continue
-        if "changed_after_baseline" in questions[i]:
-            cause = "expected facts"
+        if Path(base).name in questions[i].get("changed_after_baseline", ""):
+            cause = "expected facts"       # the note names this baseline run
         elif ab[i]["sources"] != an[i]["sources"]:
             cause = "retrieval"
         else:
             cause = "generation"
         lines.append(f"| {i} | {ab[i]['grade']} | {an[i]['grade']} | {cause} | {an[i]['reason']} |")
+    if added:
+        lines += ["", "## Questions added since the earlier run", "",
+                  "| id | grade | evidence recall@8 | judge's reason |", "|---|---|---|---|"]
+        for i in added:
+            recall = an_all[i]["evidence_recall@8"]
+            lines.append(f"| {i} | {an_all[i]['grade']} | "
+                         f"{'n/a' if recall is None else f'{recall:.2f}'} | {an_all[i]['reason']} |")
     out = Path(new) / "comparison.md"
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print("\n".join(lines))

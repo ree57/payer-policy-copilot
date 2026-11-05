@@ -57,8 +57,9 @@ Rules:
 say explicitly that you don't have that insurer's or drug's policy, and list which insurers you do \
 have for that drug, using the document list below. Do not answer from other insurers' policies as \
 a substitute. Base every "I don't have X" statement on the document list, not on which sources \
-were retrieved: if the list has a document that is not among the sources, say the provided \
-sources don't cover it, not that it doesn't exist.
+were retrieved. If a document is in the document list but not among the sources, say the \
+retrieved sources didn't include it. Never say a drug or document is missing, not covered, or \
+outside the sources when it is in the document list.
 5. For coverage questions, prefer policy and formulary sources over FDA labels, and say which \
 insurer and policy date the answer comes from.
 6. If sources disagree (different insurers or dates), say so rather than merging them.
@@ -112,10 +113,31 @@ def question_filter(question):
     return {field: values.pop() for field, values in matches.items() if len(values) == 1}
 
 
+def names_matched(question, field):
+    """Values of one metadata field ("source" or "drug") named in the question, in FILTER_RULES order."""
+    return [value for f, value, pattern in FILTER_RULES
+            if f == field and re.search(pattern, question, re.I)]
+
+
 def insurers_named(question):
     """Insurer source values named in the question, in FILTER_RULES order."""
-    return [value for field, value, pattern in FILTER_RULES
-            if field == "source" and re.search(pattern, question, re.I)]
+    return names_matched(question, "source")
+
+
+def split_filters(question):
+    """One filter per group when the question names 2+ insurers and/or 2+ drugs, else None.
+
+    "Cigna vs Aetna" -> one filter per insurer (keeping a single named drug);
+    "Repatha vs Prolia" -> one per drug (keeping a single named insurer);
+    both -> one per insurer x drug pair.
+    """
+    insurers, drugs = names_matched(question, "source"), names_matched(question, "drug")
+    if len(insurers) < 2 and len(drugs) < 2:
+        return None
+    base = question_filter(question)                 # only fields with exactly one value
+    return [{**base, **({"source": s} if s else {}), **({"drug": d} if d else {})}
+            for s in (insurers if len(insurers) >= 2 else [None])
+            for d in (drugs if len(drugs) >= 2 else [None])]
 
 
 @cache
@@ -149,36 +171,38 @@ def ranked_search(question, collection, k, where=None, use_rerank=False):
     return rerank(question, search(question, collection, k=RERANK_CANDIDATES, where=where), k)
 
 
-def retrieve_per_insurer(question, collection, k, insurers, use_rerank=False):
-    """Comparison questions: one filtered search per insurer with k split evenly, then merged.
+def retrieve_split(question, collection, k, groups, use_rerank=False):
+    """Comparison questions: one filtered search per group with k split evenly, then merged.
 
-    Each insurer gets k // n slots (the first k % n insurers one extra) and keeps any
-    drug filter; results stay grouped by insurer and are renumbered 1..k for the prompt.
-    With use_rerank, each insurer's candidates are re-ranked within that insurer.
+    Each group gets k // n slots (the first k % n groups one extra; a group with no slot
+    is skipped). Results stay grouped and are renumbered 1..k for the prompt. With
+    use_rerank, each group's candidates are re-ranked within that group.
     """
-    base = question_filter(question)                 # drops "source" when 2+ insurers match
     merged, seen = [], set()
-    for i, insurer in enumerate(insurers):
-        share = k // len(insurers) + (i < k % len(insurers))
-        for r in ranked_search(question, collection, share, {**base, "source": insurer}, use_rerank):
+    for i, where in enumerate(groups):
+        share = k // len(groups) + (i < k % len(groups))
+        for r in ranked_search(question, collection, share, where, use_rerank) if share else []:
             if r["chunk_id"] not in seen:
                 seen.add(r["chunk_id"])
                 merged.append(r)
     for rank, r in enumerate(merged, start=1):
         r["rank"] = rank
-    return merged, {**base, "source": insurers}
+    # report as e.g. {"drug": ["repatha", "prolia"]}: the fields that were split, plus the rest
+    split = {field: list(dict.fromkeys(g[field] for g in groups)) for field in groups[0]
+             if len({g[field] for g in groups}) > 1}
+    return merged, {**groups[0], **split}
 
 
 def retrieve(question, collection, k, use_filter=True, use_rerank=False):
     """Top-k chunks -> (results, filter used, fell back?). Unfiltered if the filter finds < 3.
 
-    A question naming 2+ insurers gets one search per insurer (retrieve_per_insurer),
-    so one insurer's chunks can't crowd the other's out of the top k. use_rerank
-    re-ranks RERANK_CANDIDATES embedding hits with a cross-encoder before keeping k.
+    A question naming 2+ insurers or 2+ drugs gets one search per insurer / drug
+    (retrieve_split), so one group's chunks can't crowd the others out of the top k.
+    use_rerank re-ranks RERANK_CANDIDATES embedding hits with a cross-encoder before keeping k.
     """
-    insurers = insurers_named(question) if use_filter else []
-    if len(insurers) >= 2:
-        results, where = retrieve_per_insurer(question, collection, k, insurers, use_rerank)
+    groups = split_filters(question) if use_filter else None
+    if groups:
+        results, where = retrieve_split(question, collection, k, groups, use_rerank)
         if len(results) >= MIN_FILTERED:
             return results, where, False
         return ranked_search(question, collection, k, None, use_rerank), {}, True
